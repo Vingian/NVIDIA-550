@@ -1,0 +1,292 @@
+diff --git a/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c b/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c
+--- a/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c
++++ b/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c
+@@ -2555,8 +2555,12 @@
+     status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_DYN_POWER);
+     if (status == NV_OK)
+     {
++        rmapiEnterRtd3PmPath();
++
+         status = RmTransitionDynamicPower(pGpu, bEnter, bTryAgain);
+ 
++        rmapiLeaveRtd3PmPath();
++
+         // UNLOCK: release GPUs lock
+         rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+     }
+diff --git a/src/nvidia/inc/kernel/rmapi/rmapi.h b/src/nvidia/inc/kernel/rmapi/rmapi.h
+--- a/src/nvidia/inc/kernel/rmapi/rmapi.h
++++ b/src/nvidia/inc/kernel/rmapi/rmapi.h
+@@ -102,6 +102,24 @@
+ void rmapiLockGetTimes(NV0000_CTRL_SYSTEM_GET_LOCK_TIMES_PARAMS *);
+ 
+ /**
++ * Indicates current thread is in the RTD3 PM path (rm_transition_dynamic_power) which
++ * means that certain locking asserts/checks must be skipped due to inability to acquire
++ * the API lock in this path.
++ */
++void rmapiEnterRtd3PmPath(void);
++
++/**
++ * Signifies that current thread is leaving the RTD3 PM path, restoring lock
++ * asserting/checking behavior to normal.
++ */
++void rmapiLeaveRtd3PmPath(void);
++
++/**
++ * Checks if current thread is currently running in the RTD3 PM path.
++ */
++NvBool rmapiInRtd3PmPath(void);
++
++/**
+  * Type of RM API client interface
+  */
+ typedef enum
+diff --git a/src/nvidia/src/kernel/gpu/fifo/channel_descendant.c b/src/nvidia/src/kernel/gpu/fifo/channel_descendant.c
+--- a/src/nvidia/src/kernel/gpu/fifo/channel_descendant.c
++++ b/src/nvidia/src/kernel/gpu/fifo/channel_descendant.c
+@@ -63,7 +63,7 @@
+     // Bad class creation can happen when GPU is in low power because class DB is invalid
+     NV_ASSERT(IS_VIRTUAL(pGpu) || gpuIsGpuFullPower(pGpu));
+ 
+-    NV_ASSERT(rmapiLockIsOwner() && rmGpuLockIsOwner());
++    NV_ASSERT(rmapiLockIsOwner() || rmapiInRtd3PmPath());
+ 
+     //
+     // If debug mode is enabled on this GPU, check if the GPU is occupied by a
+diff --git a/src/nvidia/src/kernel/gpu/fifo/kernel_channel.c b/src/nvidia/src/kernel/gpu/fifo/kernel_channel.c
+--- a/src/nvidia/src/kernel/gpu/fifo/kernel_channel.c
++++ b/src/nvidia/src/kernel/gpu/fifo/kernel_channel.c
+@@ -143,7 +143,7 @@
+     RsResourceRef          *pResourceRef     = pCallContext->pResourceRef;
+     RsResourceRef          *pKernelCtxShareRef = NULL;
+     NV_STATUS               status;
+-    RM_API                 *pRmApi           = rmapiGetInterface(RMAPI_API_LOCK_INTERNAL);
++    RM_API                 *pRmApi           = NULL;
+     NvHandle                hClient          = pRsClient->hClient;
+     NvHandle                hParent          = pResourceRef->pParentRef->hResource;
+     NV_CHANNEL_ALLOC_PARAMS *pChannelGpfifoParams = pParams->pAllocParams;
+@@ -172,6 +172,20 @@
+     NvU32                   callingContextGfid;
+     Device                 *pDevice;
+ 
++    if (rmapiLockIsOwner())
++    {
++        pRmApi = rmapiGetInterface(RMAPI_API_LOCK_INTERNAL);
++    }
++    else if (rmapiInRtd3PmPath())
++    {
++        pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
++    }
++    else
++    {
++        NV_PRINTF(LEVEL_ERROR, "Caller missing proper locks\n");
++        return NV_ERR_INVALID_LOCK_STATE;
++    }
++
+     // We only support physical channels.
+     NV_ASSERT_OR_RETURN(FLD_TEST_DRF(OS04, _FLAGS, _CHANNEL_TYPE, _PHYSICAL, flags),
+         NV_ERR_NOT_SUPPORTED);
+@@ -1085,7 +1099,7 @@
+     CALL_CONTEXT                *pCallContext;
+     RS_RES_FREE_PARAMS_INTERNAL *pParams;
+     NvHandle                     hClient;
+-    RM_API                      *pRmApi = rmapiGetInterface(RMAPI_API_LOCK_INTERNAL);
++    RM_API                      *pRmApi = NULL;
+     OBJGPU                      *pGpu   = GPU_RES_GET_GPU(pKernelChannel);
+     NV_STATUS                    status = NV_OK;
+     KernelChannelGroup          *pKernelChannelGroup = NULL;
+@@ -1097,6 +1111,20 @@
+     resGetFreeParams(staticCast(pKernelChannel, RsResource), &pCallContext, &pParams);
+     hClient = pCallContext->pClient->hClient;
+ 
++    if (rmapiLockIsOwner())
++    {
++        pRmApi = rmapiGetInterface(RMAPI_API_LOCK_INTERNAL);
++    }
++    else if (rmapiInRtd3PmPath())
++    {
++        pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
++    }
++    else
++    {
++        NV_PRINTF(LEVEL_ERROR, "Caller missing proper locks\n");
++        return;
++    }
++
+     ConfidentialCompute *pConfCompute = GPU_GET_CONF_COMPUTE(pGpu);
+     NvBool bCheckKeyRotation = NV_FALSE;
+     NvU32 h2dKey, d2hKey;
+diff --git a/src/nvidia/src/kernel/rmapi/alloc_free.c b/src/nvidia/src/kernel/rmapi/alloc_free.c
+--- a/src/nvidia/src/kernel/rmapi/alloc_free.c
++++ b/src/nvidia/src/kernel/rmapi/alloc_free.c
+@@ -1245,7 +1245,14 @@
+     // RS-TODO: Fix calls that use RMAPI_GPU_LOCK_INTERNAL without holding the API lock
+     if (pRmApi->bGpuLockInternal && !rmapiLockIsOwner())
+     {
+-        NV_PRINTF(LEVEL_ERROR, "RMAPI_GPU_LOCK_INTERNAL alloc requested without holding the RMAPI lock\n");
++        // CORERM-6052 targets fixing the API lockless path for RTD3.
++        if (!rmapiInRtd3PmPath())
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                "NVRM: %s: RMAPI_GPU_LOCK_INTERNAL alloc requested without holding the RMAPI lock: client:0x%x parent:0x%x object:0x%x class:0x%x\n",
++                __FUNCTION__, hClient, hParent, *phObject, hClass);
++        }
++
+         pLockInfo->flags |= RM_LOCK_FLAGS_NO_API_LOCK;
+         pLockInfo->state &= ~RM_LOCK_STATES_API_LOCK_ACQUIRED;
+     }
+@@ -1496,7 +1503,12 @@
+     // RS-TODO: Fix calls that use RMAPI_GPU_LOCK_INTERNAL without holding the API lock
+     if (pRmApi->bGpuLockInternal && !rmapiLockIsOwner())
+     {
+-        NV_PRINTF(LEVEL_ERROR, "RMAPI_GPU_LOCK_INTERNAL free requested without holding the RMAPI lock\n");
++        // CORERM-6052 targets fixing the API lockless path for RTD3.
++        if (!rmapiInRtd3PmPath())
++        {
++            NV_PRINTF(LEVEL_ERROR, "RMAPI_GPU_LOCK_INTERNAL free requested without holding the RMAPI lock\n");
++        }
++
+         lockInfo.flags |= RM_LOCK_FLAGS_NO_API_LOCK;
+         lockInfo.state &= ~RM_LOCK_STATES_API_LOCK_ACQUIRED;
+     }
+diff --git a/src/nvidia/src/kernel/rmapi/client.c b/src/nvidia/src/kernel/rmapi/client.c
+--- a/src/nvidia/src/kernel/rmapi/client.c
++++ b/src/nvidia/src/kernel/rmapi/client.c
+@@ -761,6 +761,7 @@
+     OBJGPU *pGpu;
+     NvBool bBcState;
+     NvBool bRestoreBcState = NV_FALSE;
++    RsClient *pRsClient = staticCast(pClient, RsClient);
+ 
+     if (gpuGetByRef(pRmFreeParams->pResourceRef, NULL, &pGpu) == NV_OK)
+     {
+@@ -770,7 +771,17 @@
+ 
+     rmapiFreeResourcePrologue(pRmFreeParams);
+ 
+-    status = clientFreeResource_IMPL(staticCast(pClient, RsClient), pServer, pRmFreeParams);
++    //
++    // In the RTD3 case, the API lock isn't taken since it can be initiated
++    // from another thread that holds the API lock and because we now hold
++    // the GPU lock.
++    //
++    if (rmapiInRtd3PmPath())
++    {
++        pRmFreeParams->pLockInfo->flags |= RM_LOCK_FLAGS_NO_API_LOCK;
++    }
++
++    status = clientFreeResource_IMPL(pRsClient, pServer, pRmFreeParams);
+ 
+     if (bRestoreBcState)
+     {
+diff --git a/src/nvidia/src/kernel/rmapi/mapping.c b/src/nvidia/src/kernel/rmapi/mapping.c
+--- a/src/nvidia/src/kernel/rmapi/mapping.c
++++ b/src/nvidia/src/kernel/rmapi/mapping.c
+@@ -381,6 +381,17 @@
+     lockInfo.flags |= RM_LOCK_FLAGS_GPU_GROUP_LOCK |
+                       RM_LOCK_FLAGS_NO_GPUS_LOCK;
+ 
++    //
++    // In the RTD3 case, the API lock isn't taken since it can be initiated
++    // from another thread that holds the API lock and because we now hold
++    // the GPU lock.
++    //
++    if (rmapiInRtd3PmPath())
++    {
++        lockInfo.flags |= RM_LOCK_FLAGS_NO_API_LOCK;
++        lockInfo.state &= ~RM_LOCK_STATES_API_LOCK_ACQUIRED;
++    }
++
+     LOCK_METER_DATA(MAPMEM_DMA, flags, 0, 0);
+ 
+ 
+diff --git a/src/nvidia/src/kernel/rmapi/mapping_cpu.c b/src/nvidia/src/kernel/rmapi/mapping_cpu.c
+--- a/src/nvidia/src/kernel/rmapi/mapping_cpu.c
++++ b/src/nvidia/src/kernel/rmapi/mapping_cpu.c
+@@ -1156,6 +1156,17 @@
+         return status;
+     }
+ 
++    //
++    // In the RTD3 case, the API lock isn't taken since it can be initiated
++    // from another thread that holds the API lock and because we now hold
++    // the GPU lock.
++    //
++    if (rmapiInRtd3PmPath())
++    {
++        lockInfo.flags |= RM_LOCK_FLAGS_NO_API_LOCK;
++        lockInfo.state &= ~RM_LOCK_STATES_API_LOCK_ACQUIRED;
++    }
++
+     LOCK_METER_DATA(MAPMEM, flags, 0, 0);
+ 
+     // clear params for good measure
+diff --git a/src/nvidia/src/kernel/rmapi/rmapi.c b/src/nvidia/src/kernel/rmapi/rmapi.c
+--- a/src/nvidia/src/kernel/rmapi/rmapi.c
++++ b/src/nvidia/src/kernel/rmapi/rmapi.c
+@@ -57,6 +57,8 @@
+ static NvBool     g_bResServInit = NV_FALSE;
+ static RMAPI_LOCK g_RmApiLock;
+ 
++static NvU64 g_rtd3PmPathThreadId = ~0ULL;
++
+ static void _rmapiInitInterface(RM_API *pRmApi, API_SECURITY_INFO *pDefaultSecurityInfo, NvBool bTlsInternal,
+                                 NvBool bApiLockInternal, NvBool bGpuLockInternal);
+ static NV_STATUS _rmapiLockAlloc(void);
+@@ -834,6 +836,38 @@
+ }
+ 
+ //
++// Indicates current thread is in the RTD3 PM path (rm_transition_dynamic_power) which
++// means that certain locking asserts/checks must be skipped due to inability to acquire
++// the API lock in this path.
++//
++void rmapiEnterRtd3PmPath(void)
++{
++    // RTD3 path cannot be entered without the GPU lock
++    NV_ASSERT(rmGpuLockIsOwner());
++
++    NV_ASSERT(g_rtd3PmPathThreadId == ~0ULL);
++    g_rtd3PmPathThreadId = portThreadGetCurrentThreadId();
++}
++
++//
++// Signifies that current thread is leaving the RTD3 PM path, restoring lock
++// asserting/checking behavior to normal.
++//
++void rmapiLeaveRtd3PmPath(void)
++{
++    NV_ASSERT(rmapiInRtd3PmPath());
++    g_rtd3PmPathThreadId = ~0ULL;
++}
++
++//
++// Checks if current thread is currently running in the RTD3 PM path.
++//
++NvBool rmapiInRtd3PmPath(void)
++{
++    return (g_rtd3PmPathThreadId == portThreadGetCurrentThreadId());
++}
++
++//
+ // Mark for deletion the client resources from the data base, given a GPU mask
+ //
+ void
+diff --git a/src/nvidia/src/kernel/rmapi/rs_utils.c b/src/nvidia/src/kernel/rmapi/rs_utils.c
+--- a/src/nvidia/src/kernel/rmapi/rs_utils.c
++++ b/src/nvidia/src/kernel/rmapi/rs_utils.c
+@@ -246,8 +246,11 @@
+     NV_STATUS status;
+     RmClient *pClient;
+ 
+-    // LOCK TEST: we should have the API lock here
+-    LOCK_ASSERT_AND_RETURN(rmapiLockIsOwner());
++    //
++    // LOCK TEST: we should have the API lock here unless we're executing out of
++    // the power management path.
++    //
++    LOCK_ASSERT_AND_RETURN(rmapiLockIsOwner() || rmapiInRtd3PmPath());
+ 
+     pClient = serverutilGetClientUnderLock(hClient);
+ 

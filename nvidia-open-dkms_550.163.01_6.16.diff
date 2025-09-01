@@ -1,0 +1,102 @@
+diff --git a/kernel-open/conftest.sh b/kernel-open/conftest.sh
+--- a/kernel-open/conftest.sh
++++ b/kernel-open/conftest.sh
+@@ -4075,33 +4075,6 @@
+             fi
+         ;;
+ 
+-        dma_buf_has_dynamic_attachment)
+-            #
+-            # Determine if the function dma_buf_attachment_is_dynamic()
+-            # is present.
+-            #
+-            # Added by commit: 15fd552d186c
+-            # ("dma-buf: change DMA-buf locking convention v3") in v5.5 (2018-07-03)
+-            #
+-            echo "$CONFTEST_PREAMBLE
+-            #include <linux/dma-buf.h>
+-            bool conftest_dma_buf_attachment_is_dynamic(void) {
+-                return dma_buf_attachment_is_dynamic(NULL);
+-            }" > conftest$$.c
+-
+-            $CC $CFLAGS -c conftest$$.c > /dev/null 2>&1
+-            rm -f conftest$$.c
+-
+-            if [ -f conftest$$.o ]; then
+-                echo "#define NV_DMA_BUF_HAS_DYNAMIC_ATTACHMENT" | append_conftest "functions"
+-                rm -f conftest$$.o
+-                return
+-            else
+-                echo "#undef NV_DMA_BUF_HAS_DYNAMIC_ATTACHMENT" | append_conftest "functions"
+-                return
+-            fi
+-        ;;
+-
+         dma_buf_attachment_has_peer2peer)
+             #
+             # Determine if peer2peer is present in struct dma_buf_attachment.
+diff --git a/kernel-open/nvidia/nv-dmabuf.c b/kernel-open/nvidia/nv-dmabuf.c
+--- a/kernel-open/nvidia/nv-dmabuf.c
++++ b/kernel-open/nvidia/nv-dmabuf.c
+@@ -783,10 +783,9 @@
+     // On non-coherent platforms, importers must be able to handle peer
+     // MMIO resources not backed by struct page.
+     //
+-#if defined(NV_DMA_BUF_HAS_DYNAMIC_ATTACHMENT) && \
+-    defined(NV_DMA_BUF_ATTACHMENT_HAS_PEER2PEER)
++#if defined(NV_DMA_BUF_ATTACHMENT_HAS_PEER2PEER)
+     if (!priv->nv->coherent &&
+-        dma_buf_attachment_is_dynamic(attachment) &&
++        (attachment->importer_ops != NULL) &&
+         !attachment->peer2peer)
+     {
+         nv_printf(NV_DBG_ERRORS,
+diff --git a/kernel-open/nvidia/nvidia.Kbuild b/kernel-open/nvidia/nvidia.Kbuild
+--- a/kernel-open/nvidia/nvidia.Kbuild
++++ b/kernel-open/nvidia/nvidia.Kbuild
+@@ -188,7 +188,6 @@
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_ops_has_kmap_atomic
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_ops_has_map
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_ops_has_map_atomic
+-NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_has_dynamic_attachment
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_attachment_has_peer2peer
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_set_mask_and_coherent
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += devm_clk_bulk_get_all
+@@ -237,6 +236,8 @@
+ NV_CONFTEST_SYMBOL_COMPILE_TESTS += ecc_digits_from_bytes
+ NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_present_timer_delete_sync
+ NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_present_hrtimer_setup
++NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_gpl_iommu_dev_enable_feature
++NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_gpl_iommu_dev_disable_feature
+ 
+ NV_CONFTEST_TYPE_COMPILE_TESTS += dma_ops
+ NV_CONFTEST_TYPE_COMPILE_TESTS += swiotlb_dma_ops
+diff --git a/kernel-open/nvidia-uvm/uvm_ats_sva.c b/kernel-open/nvidia-uvm/uvm_ats_sva.c
+--- a/kernel-open/nvidia-uvm/uvm_ats_sva.c
++++ b/kernel-open/nvidia-uvm/uvm_ats_sva.c
+@@ -308,12 +308,13 @@
+ 
+ NV_STATUS uvm_ats_sva_add_gpu(uvm_parent_gpu_t *parent_gpu)
+ {
++#if NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_enable_feature
+     int ret;
+ 
+     ret = iommu_dev_enable_feature(&parent_gpu->pci_dev->dev, IOMMU_DEV_FEAT_SVA);
+     if (ret)
+         return errno_to_nv_status(ret);
+-
++#endif
+     if (UVM_ATS_SMMU_WAR_REQUIRED())
+         return uvm_ats_smmu_war_init(parent_gpu);
+     else
+@@ -324,8 +325,9 @@
+ {
+     if (UVM_ATS_SMMU_WAR_REQUIRED())
+         uvm_ats_smmu_war_deinit(parent_gpu);
+-
++#if NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_disable_feature
+     iommu_dev_disable_feature(&parent_gpu->pci_dev->dev, IOMMU_DEV_FEAT_SVA);
++#endif
+ }
+ 
+ NV_STATUS uvm_ats_sva_bind_gpu(uvm_gpu_va_space_t *gpu_va_space)
